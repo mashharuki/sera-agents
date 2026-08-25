@@ -25,6 +25,7 @@ import {
   type PaymentRequirements,
 } from "./facilitator.js";
 import type { SeraMcpClient } from "./sera-client.js";
+import { atomicToUsdc } from "./money.js";
 
 export interface VerifyOutcome {
   ok: boolean;
@@ -65,7 +66,7 @@ function paymentRequirements(
   return {
     scheme: "exact",
     network: cfg.cdpNetwork,
-    maxAmountRequired: String(Math.ceil(pending.amount_usdc * 1e6)), // USDC base units
+    maxAmountRequired: pending.amount_usdc, // exact USDC base units
     resource: `https://${cfg.host}:${cfg.port}/x402/swap`,
     description: `Sera FX delivery: ${pending.swap_request.amount} ${pending.swap_request.to_currency} → ${pending.swap_request.recipient}`,
     mimeType: "application/json",
@@ -143,7 +144,7 @@ export async function executeSwap(
       arguments: {
         from: "USDC",
         to: pending.swap_request.to_currency,
-        amount: pending.amount_usdc,
+        amount: Number(atomicToUsdc(pending.amount_usdc)),
         owner_address: cfg.vaultAddress,
         recipient: pending.swap_request.recipient,
         gas_mode: "pay_more",

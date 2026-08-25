@@ -133,7 +133,9 @@ export async function facilitatorVerify(
       };
     }
     const data = (await res.json()) as VerifyResult;
-    return data;
+    // Do not infer success from HTTP 2xx alone: delivery is allowed only on
+    // the facilitator's explicit boolean grant.
+    return { ...data, isValid: res.ok && data.isValid === true };
   } catch (e: any) {
     return { isValid: false, invalidReason: `facilitator unreachable: ${e?.message ?? String(e)}` };
   }
@@ -164,7 +166,8 @@ export async function facilitatorSettle(
       return { success: false, error: `facilitator ${res.status}: ${text.slice(0, 200)}` };
     }
     const data = (await res.json()) as SettleResult;
-    return data;
+    // Do not infer settlement from HTTP 2xx alone.
+    return { ...data, success: res.ok && data.success === true };
   } catch (e: any) {
     return { success: false, error: `facilitator unreachable: ${e?.message ?? String(e)}` };
   }
