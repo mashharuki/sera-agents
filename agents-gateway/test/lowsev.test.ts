@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { GatewayError } from "../src/errors.js";
 import { makeHandlers, mulDecimal } from "../src/handlers.js";
 import { makeQuoteCache } from "../src/quote-cache.js";
+import type { SeraMcpClient } from "../src/sera-mcp-client.js";
 
 describe("mulDecimal — exact decimal product (no float artifacts)", () => {
   it("computes precise products", () => {
@@ -33,8 +34,7 @@ describe("handlers — error status classification", () => {
     } as any;
     return makeHandlers(mcp, makeQuoteCache());
   }
-  const signer = "0x" + "a".repeat(40);
-
+  const signer = `0x${"a".repeat(40)}`;
   it("quote returns a precise amount_out and a quote_id", async () => {
     const q = await make("1.5").quote({ from_token: "A", to_token: "B", amount: "0.2" });
     expect(q.amount_out).toBe("0.3");
@@ -63,6 +63,23 @@ describe("handlers — error status classification", () => {
       .catch((e) => e);
     expect(err).toBeInstanceOf(GatewayError);
     expect(err.status).toBe(400);
+  });
+
+  it("quote validates the amount before any upstream call (no RPC on bad input)", async () => {
+    const calls: string[] = [];
+    const mcp: SeraMcpClient = {
+      async callTool<T>(name: string): Promise<T> {
+        calls.push(name);
+        return { rate: "1.5" } as T;
+      },
+      running: () => true,
+      shutdown: () => {},
+    };
+    const h = makeHandlers(mcp, makeQuoteCache());
+    const err = await h.quote({ from_token: "A", to_token: "B", amount: "abc" }).catch((e) => e);
+    expect(err).toBeInstanceOf(GatewayError);
+    expect(err.status).toBe(400);
+    expect(calls).toEqual([]); // rejected before any upstream RPC
   });
 
   it("quote → plain Error (→502) on a non-numeric upstream rate", async () => {

@@ -24,6 +24,9 @@ import {
   type FacilitatorConfig,
   type PaymentRequirements,
 } from "./facilitator.js";
+import { checkOnce } from "./payment-confirm.js";
+import { parsePaymentAuthorization } from "./payment-binding.js";
+import { verifyTransferAuthorization } from "./eip3009.js";
 import type { SeraMcpClient } from "./sera-client.js";
 
 export interface VerifyOutcome {
@@ -48,11 +51,14 @@ export interface ExecuteOutcome {
 }
 
 function makeFacilitatorConfig(cfg: X402Config): FacilitatorConfig {
-  // Caller has already passed env safety gates — non-null assertions are safe.
+  // Caller has already passed env safety gates — non-null assertions are safe
+  // for the fields the gates require for the configured kind.
   return {
+    kind: cfg.facilitatorKind,
     url: cfg.facilitatorUrl!,
-    apiKeyId: cfg.cdpApiKeyId!,
-    apiKeySecret: cfg.cdpApiKeySecret!,
+    apiKeyId: cfg.cdpApiKeyId,
+    apiKeySecret: cfg.cdpApiKeySecret,
+    bearerToken: cfg.facilitatorToken,
     network: cfg.cdpNetwork,
     confirmationDepth: cfg.confirmationDepth,
   };
@@ -118,6 +124,79 @@ export async function settlePayment(
     return { ok: false, reason: result.error ?? "settle failed" };
   }
   return { ok: true, txHash: result.txHash, networkId: result.networkId };
+}
+
+// ── On-chain confirmation gate ───────────────────────────────────────────
+// Independently verifies the settle tx actually moved >= the required USDC
+// into the vault, at >= confirmationDepth. This is the control that makes a
+// lying/compromised facilitator unable to trigger free delivery. Demo mode
+// and the explicit X402_SKIP_ONCHAIN_CONFIRM opt-out skip it.
+export interface ConfirmOutcome {
+  ok: boolean;
+  reason?: string;
+  skipped?: boolean;
+}
+
+export async function confirmPayment(
+  cfg: X402Config,
+  pending: PendingPayment,
+  settleTxHash: string | undefined,
+  paymentAuthorizationHeader: string,
+): Promise<ConfirmOutcome> {
+  if (cfg.mode === "demo") return { ok: true, skipped: true };
+  if (cfg.skipOnchainConfirm && !cfg.rpcUrl) return { ok: true, skipped: true };
+  if (!cfg.rpcUrl) return { ok: false, reason: "no X402_RPC_URL configured" };
+  if (!settleTxHash) {
+    // Facilitator claimed success but produced no tx hash — nothing to verify.
+    return { ok: false, reason: "settle returned no txHash to confirm on-chain" };
+  }
+
+  // Anti-replay binding: the confirmation must prove THIS payer paid exactly
+  // what THIS payment's signed EIP-3009 authorization says, into the vault.
+  // An unparseable authorization is a hard reject — never pay out against a
+  // proof we cannot bind.
+  const auth = parsePaymentAuthorization(paymentAuthorizationHeader);
+  if (!auth) return { ok: false, reason: "payment authorization unparseable — cannot bind confirmation" };
+
+  const asset = cfg.cdpUsdcAddress ?? "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+  const required = BigInt(String(Math.ceil(pending.amount_usdc * 1e6)));
+  if (auth.to !== cfg.vaultAddress!.toLowerCase()) {
+    return { ok: false, reason: "authorization recipient is not the vault" };
+  }
+  if (BigInt(auth.value) < required) {
+    return { ok: false, reason: "authorized value below required amount" };
+  }
+
+  // CRYPTOGRAPHIC BINDING — the load-bearing anti-forgery check. Recover the
+  // EIP-3009 signer and require it to equal `from`, so a malicious facilitator
+  // cannot claim someone else's `from`/tx. Without a chainId we cannot verify
+  // and therefore refuse (fail-closed).
+  if (cfg.chainId === undefined) {
+    return { ok: false, reason: "no chainId configured for signature verification" };
+  }
+  const sig = await verifyTransferAuthorization(
+    auth,
+    auth.signature,
+    { name: cfg.usdcName, version: cfg.usdcVersion, chainId: cfg.chainId, verifyingContract: asset },
+    Date.now() / 1000,
+  );
+  if (!sig.ok) return { ok: false, reason: `payment signature invalid: ${sig.reason}` };
+
+  // Single shot per request — the client drives retry cadence via 202s; no
+  // long in-handler poll to park connections on.
+  const result = await checkOnce(
+    {
+      rpcUrl: cfg.rpcUrl,
+      asset,
+      vault: cfg.vaultAddress!,
+      minAmountBaseUnits: required.toString(),
+      confirmationDepth: cfg.confirmationDepth,
+      payerFrom: auth.from,
+      exactValueBaseUnits: auth.value,
+    },
+    settleTxHash,
+  );
+  return result.confirmed ? { ok: true } : { ok: false, reason: result.reason };
 }
 
 // ── Execute Sera swap ────────────────────────────────────────────────────
@@ -191,6 +270,17 @@ export function transitionToDelivered(
   return store.cas(pending.payment_id, "executing", "delivered", {
     delivered_payload: deliveredPayload,
     settlement_payload: settlementPayload,
+  });
+}
+
+/** Facilitator /settle failed: no USDC charged — terminal, NOT refundable. */
+export function transitionToSettleFailed(
+  store: StateStore,
+  pending: PendingPayment,
+  error: string,
+): boolean {
+  return store.cas(pending.payment_id, "verified", "settle_failed", {
+    last_error: error,
   });
 }
 

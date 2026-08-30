@@ -2,6 +2,7 @@
  * Payment state machine + persistence.
  *
  * pending → verified → executing → delivered | failed_refundable
+ *                     ↘ settle_failed (no charge — terminal, not refundable)
  *
  * Idempotency: every state mutation writes via SQLite UPSERT keyed on
  * payment_id. The HTTP layer is then idempotent on retry — a re-issued
@@ -19,7 +20,9 @@ export type PaymentStatus =
   | "verified"
   | "executing"
   | "delivered"
-  | "failed_refundable";
+  | "failed_refundable"
+  /** Facilitator /settle failed — no USDC was charged; NOT a refund case. */
+  | "settle_failed";
 
 export interface PendingPayment {
   payment_id: string;
@@ -51,12 +54,20 @@ export interface StateStore {
   cas(id: string, expected: PaymentStatus, next: PaymentStatus, extra?: Partial<PendingPayment>): boolean;
   /** All `failed_refundable` payments — operator queries for manual refund queue. */
   listFailedRefundable(limit?: number): PendingPayment[];
+  /**
+   * Single-use claim of an on-chain settle tx hash (anti-replay): returns
+   * true iff `txHash` is unclaimed or already claimed by THIS payment_id
+   * (idempotent retries). A hash claimed by a different payment is refused —
+   * one on-chain payment can authorize at most one delivery.
+   */
+  claimTx(txHash: string, paymentId: string): boolean;
   size(): number;
   gcExpired(now: number): void;
 }
 
 export function makeStore(stateDbPath: string | undefined, pendingMax: number): StateStore {
   const mem = new Map<string, PendingPayment>();
+  const memTxClaims = new Map<string, string>();
   let db: Database.Database | null = null;
 
   if (stateDbPath) {
@@ -83,6 +94,11 @@ export function makeStore(stateDbPath: string | undefined, pendingMax: number): 
         );
         CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status);
         CREATE INDEX IF NOT EXISTS idx_payments_expires ON payments(expires_at);
+        CREATE TABLE IF NOT EXISTS consumed_txs (
+          tx_hash TEXT PRIMARY KEY,
+          payment_id TEXT NOT NULL,
+          claimed_at INTEGER NOT NULL
+        );
       `);
       process.stderr.write(`x402: payment state persisted to ${stateDbPath}\n`);
     } catch (e: any) {
@@ -220,6 +236,27 @@ export function makeStore(stateDbPath: string | undefined, pendingMax: number): 
       if (extra?.settlement_payload !== undefined) p.settlement_payload = extra.settlement_payload;
       if (extra?.last_error !== undefined) p.last_error = extra.last_error;
       return true;
+    },
+    claimTx(txHash, paymentId) {
+      const key = txHash.toLowerCase();
+      if (db) {
+        // INSERT OR IGNORE is atomic on the PRIMARY KEY; ownership then
+        // decides. Idempotent for retries of the same payment.
+        db.prepare(
+          `INSERT OR IGNORE INTO consumed_txs (tx_hash, payment_id, claimed_at)
+           VALUES (?, ?, ?)`,
+        ).run(key, paymentId, Math.floor(Date.now() / 1000));
+        const row = db
+          .prepare(`SELECT payment_id FROM consumed_txs WHERE tx_hash = ?`)
+          .get(key) as { payment_id: string } | undefined;
+        return row?.payment_id === paymentId;
+      }
+      const owner = memTxClaims.get(key);
+      if (owner === undefined) {
+        memTxClaims.set(key, paymentId);
+        return true;
+      }
+      return owner === paymentId;
     },
     listFailedRefundable(limit = 100) {
       if (!db) {

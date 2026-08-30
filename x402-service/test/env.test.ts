@@ -94,6 +94,8 @@ describe("loadConfig — live-mode required envs", () => {
     process.env.X402_CDP_API_KEY_ID = "test-id";
     process.env.X402_CDP_API_KEY_SECRET = "test-secret";
     process.env.X402_VAULT_ADDRESS = "0x" + "a".repeat(40);
+    process.env.X402_RPC_URL = "https://rpc.test";
+    process.env.X402_STATE_DB = "/tmp/x402-test-state.db";
   }
 
   it("refuses live mode without X402_FACILITATOR_URL", () => {
@@ -141,6 +143,48 @@ describe("loadConfig — live-mode required envs", () => {
       expect(() => loadConfig()).toThrow();
       const msg = spyErr.mock.calls.map((c) => String(c[0])).join("");
       expect(msg).toMatch(/X402_VAULT_ADDRESS/);
+    } finally {
+      spyExit.mockRestore();
+      spyErr.mockRestore();
+    }
+  });
+
+  it("refuses live mode without X402_STATE_DB (durable anti-replay ledger)", () => {
+    setLiveBase();
+    delete process.env.X402_STATE_DB;
+    const spyExit = vi.spyOn(process, "exit").mockImplementation((() => { throw new Error("exit"); }) as any);
+    const spyErr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    try {
+      expect(() => loadConfig()).toThrow();
+      expect(spyErr.mock.calls.map((c) => String(c[0])).join("")).toMatch(/X402_STATE_DB/);
+    } finally { spyExit.mockRestore(); spyErr.mockRestore(); }
+  });
+
+  it("refuses live mode when chainId can't be derived (signature verification needs it)", () => {
+    setLiveBase();
+    process.env.X402_NETWORK = "weirdnet";
+    process.env.X402_USDC_ADDRESS = "0x" + "c".repeat(40); // pass the non-base USDC gate
+    delete process.env.X402_CHAIN_ID;
+    const spyExit = vi.spyOn(process, "exit").mockImplementation((() => { throw new Error("exit"); }) as any);
+    const spyErr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    try {
+      expect(() => loadConfig()).toThrow();
+      expect(spyErr.mock.calls.map((c) => String(c[0])).join("")).toMatch(/chainId/);
+    } finally { spyExit.mockRestore(); spyErr.mockRestore(); }
+  });
+
+  it("refuses live mode on a non-base network without X402_USDC_ADDRESS", () => {
+    setLiveBase();
+    process.env.X402_NETWORK = "eip155:11155111";
+    delete process.env.X402_USDC_ADDRESS;
+    const spyExit = vi.spyOn(process, "exit").mockImplementation((() => {
+      throw new Error("exit");
+    }) as any);
+    const spyErr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    try {
+      expect(() => loadConfig()).toThrow();
+      const msg = spyErr.mock.calls.map((c) => String(c[0])).join("");
+      expect(msg).toMatch(/X402_USDC_ADDRESS/);
     } finally {
       spyExit.mockRestore();
       spyErr.mockRestore();

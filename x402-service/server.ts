@@ -37,9 +37,11 @@ import { makeStore, type PendingPayment } from "./state.js";
 import { makeSeraMcpClient } from "./sera-client.js";
 import {
   verifyPayment,
+  confirmPayment,
   settlePayment,
   executeSwap,
   transitionToVerified,
+  transitionToSettleFailed,
   transitionToExecuting,
   transitionToDelivered,
   transitionToFailedRefundable,
@@ -98,6 +100,11 @@ function clientIp(c: { req: { header: (n: string) => string | undefined } }): st
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────
+/** Strip CR/LF so upstream-controlled text can't forge log lines. */
+function sanitizeForLog(text: string): string {
+  return text.replace(/[\r\n]+/g, " ").slice(0, 300);
+}
+
 async function quoteRecipientAmountViaMcp(
   to: string,
   recipient_amount: number,
@@ -331,6 +338,11 @@ app.post("/x402/swap", async (c) => {
   if (pending.status === "executing") {
     return c.json({ error: "still_executing", retry_after_seconds: 5 }, 202);
   }
+  if (pending.status === "settle_failed") {
+    // Terminal: facilitator /settle failed, no USDC was charged. Idempotent
+    // clean response on retry (not a 500, not a refund case).
+    return c.json({ error: "settle_failed", payment_id: pending.payment_id, charged: false }, 409);
+  }
   if (pending.status === "failed_refundable") {
     // Failure is terminal at the HTTP layer. Operators see these via
     // /admin/refundables. We do NOT auto-revert to executing — the swap
@@ -372,14 +384,15 @@ app.post("/x402/swap", async (c) => {
     // Settle BEFORE releasing service (two-phase). In demo mode this is a no-op.
     const settleResult = await settlePayment(cfg, pending, authorization ?? "");
     if (!settleResult.ok) {
-      // Settle failed AFTER verify succeeded — this is the bad case. We don't
-      // re-charge the payer (verify proved their auth). We mark the payment
-      // failed_refundable so operator can investigate. Future iterations can
-      // automate refund here if the facilitator supports settlement reversal.
-      transitionToExecuting(store, pending); // move to executing first so transitionToFailedRefundable matches
-      transitionToFailedRefundable(store, pending, `settle_failed: ${settleResult.reason}`);
+      // Settle failed after verify: no USDC was charged, so this is NOT a
+      // refund case — mark it terminal `settle_failed` in a single CAS from
+      // `verified` (never touches a concurrently-executing payment).
+      transitionToSettleFailed(store, pending, sanitizeForLog(settleResult.reason ?? "settle failed"));
+      process.stderr.write(
+        `[settle] ${pending.payment_id}: failed (no charge): ${sanitizeForLog(settleResult.reason ?? "")}\n`,
+      );
       return c.json(
-        { error: "settle_failed", payment_id: pending.payment_id, reason: settleResult.reason },
+        { error: "settle_failed", payment_id: pending.payment_id, charged: false },
         502,
       );
     }
@@ -393,6 +406,48 @@ app.post("/x402/swap", async (c) => {
   if (!current) return c.json({ error: "lost_state" }, 500);
 
   if (current.status === "verified") {
+    // ── On-chain confirmation gate (verified → executing edge) ─────────
+    // The facilitator said the payment settled; independently confirm the
+    // USDC actually landed in the vault before releasing any FX. Sits on
+    // this edge so a payment that hasn't confirmed yet stays `verified` and
+    // every client retry re-checks — a lying facilitator can never push a
+    // payment past this point. Pure read; safe to repeat.
+    let settleTxHash: string | undefined;
+    try {
+      settleTxHash = current.settlement_payload
+        ? (JSON.parse(current.settlement_payload) as { txHash?: string }).txHash
+        : undefined;
+    } catch {
+      settleTxHash = undefined;
+    }
+    const confirmResult = await confirmPayment(cfg, current, settleTxHash, authorization ?? "");
+    if (!confirmResult.ok) {
+      // Detail stays server-side; clients get a generic retriable signal.
+      process.stderr.write(
+        `[confirm] ${current.payment_id}: not confirmed on-chain yet: ${sanitizeForLog(confirmResult.reason ?? "")}\n`,
+      );
+      return c.json(
+        {
+          error: "payment_not_confirmed_onchain",
+          payment_id: current.payment_id,
+          retry_after_seconds: 10,
+        },
+        202,
+      );
+    }
+    // Anti-replay: one on-chain settle tx authorizes at most one delivery.
+    // Atomic claim (idempotent for retries of this same payment). Skipped
+    // only when no real confirm ran (demo / explicit opt-out => no txHash).
+    if (settleTxHash && !store.claimTx(settleTxHash, current.payment_id)) {
+      process.stderr.write(
+        `[confirm] ${current.payment_id}: settle tx already consumed by another payment — refusing\n`,
+      );
+      return c.json(
+        { error: "payment_proof_already_used", payment_id: current.payment_id },
+        402,
+      );
+    }
+
     if (!transitionToExecuting(store, current)) {
       // Another concurrent request already moved it.
       const fresh = store.load(paymentId);
