@@ -1,6 +1,6 @@
-import type { SeraMcpClient } from "./sera-mcp-client.js";
-import type { QuoteCache } from "./quote-cache.js";
 import { GatewayError } from "./errors.js";
+import type { QuoteCache } from "./quote-cache.js";
+import type { SeraMcpClient } from "./sera-mcp-client.js";
 
 /**
  * Max currency pairs per `/rates` (and the MCP `rates` tool) request. Each pair
@@ -88,7 +88,7 @@ export function mulDecimal(a: string, b: string): string {
   const parse = (s: string) => {
     const neg = s.startsWith("-");
     const [int, frac = ""] = s.replace(/^[+-]/, "").split(".");
-    return { digits: BigInt((int + frac) || "0"), scale: frac.length, neg };
+    return { digits: BigInt(int + frac || "0"), scale: frac.length, neg };
   };
   const x = parse(a.trim());
   const y = parse(b.trim());
@@ -159,18 +159,19 @@ export function makeHandlers(mcp: SeraMcpClient, cache: QuoteCache) {
     amount: string;
   }): Promise<QuoteResult> {
     const { from_token, to_token, amount } = args;
-    const rate = await mcp.callTool<SeraFxRate>("sera.get_fx_rate", {
-      base: from_token,
-      quote: to_token,
-    });
-    const rateStr = asString(rate.rate).trim();
-    // A bad amount is caller input (400); a bad upstream rate is our fault (502).
+    // A bad amount is caller input (400) — validate before any upstream RPC.
     if (!DECIMAL.test(amount.trim())) {
       throw new GatewayError(400, "amount must be a decimal number");
     }
     if (Number(amount) <= 0) {
       throw new GatewayError(400, "amount must be greater than zero");
     }
+    const rate = await mcp.callTool<SeraFxRate>("sera.get_fx_rate", {
+      base: from_token,
+      quote: to_token,
+    });
+    const rateStr = asString(rate.rate).trim();
+    // A bad upstream rate is our fault (502).
     if (!DECIMAL.test(rateStr)) {
       throw new Error("sera-mcp returned a non-numeric rate");
     }
@@ -189,7 +190,10 @@ export function makeHandlers(mcp: SeraMcpClient, cache: QuoteCache) {
     const original = cache.lookup(args.quote_id);
     if (!original) {
       // Unknown/expired quote is a caller-recoverable condition → 404, not 502.
-      throw new GatewayError(404, `quote_id ${args.quote_id} unknown or expired — call /quote again`);
+      throw new GatewayError(
+        404,
+        `quote_id ${args.quote_id} unknown or expired — call /quote again`,
+      );
     }
     const prepared = await mcp.callTool<SeraQuote>("sera.prepare_swap", {
       from: original.from_token,

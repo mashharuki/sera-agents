@@ -10,12 +10,14 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
+    "e2e:sepolia": "node scripts/sepolia-e2e.mjs",
     "audit": "npm audit --omit=dev --audit-level=high"
   },
   "dependencies": {
     "@hono/node-server": "^1.13.0",
     "better-sqlite3": "^12.10.0",
     "hono": "^4.6.0",
+    "viem": "^2.55.19",
     "zod": "^4.4.3"
   },
   "devDependencies": {

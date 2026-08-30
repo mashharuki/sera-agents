@@ -1,18 +1,28 @@
 /**
- * Coinbase CDP x402 facilitator client — verify + settle.
+ * x402 facilitator clients — verify + settle.
  *
- * Two endpoints:
- *   POST {facilitator_url}/verify  → { isValid, invalidReason? }
- *   POST {facilitator_url}/settle  → { success, txHash, networkId }
+ * Two interchangeable backends behind one `Facilitator` interface:
+ *
+ *   - "cdp"        Coinbase CDP hosted facilitator. Auth: short-lived ES256
+ *                  JWT (request-bound). Networks: base | base-sepolia |
+ *                  polygon | arbitrum | solana (per CDP docs).
+ *   - "selfhosted" Any facilitator implementing the open x402 /verify +
+ *                  /settle shape — e.g. the Apache-2.0 reference facilitator
+ *                  from coinbase/x402 run on your own infra against any EVM
+ *                  RPC (incl. Ethereum Sepolia, eip155:11155111). Auth:
+ *                  optional static bearer token — it is YOUR service.
+ *
+ * SECURITY: the service must NOT deliver on the facilitator's word alone.
+ * A compromised facilitator can return isValid/success:true for a payment
+ * that never happened. The on-chain confirmation gate (payment-confirm.ts)
+ * independently verifies the USDC transfer landed in the vault before the
+ * swap executes. Facilitator responses are treated as hints; the chain is
+ * the authority.
  *
  * Per arXiv:2605.11781 ("Five Attacks on x402"):
  *   - Two-phase: verify before settle. Atomic idempotency reserve between them.
  *   - Bound facilitator caller identity (mitigates Attack I-B settlement preemption).
- *   - Confirmation depth k≥3 on Base mainnet (mitigates Attack I-A revert-grant).
- *
- * This client is NOT production-verified against Coinbase mainnet. Treat the
- * shape below as best-effort against published API; expect to refine after
- * the first Base Sepolia E2E test.
+ *   - Confirmation depth k≥3 (mitigates Attack I-A revert-grant).
  */
 
 import { createPrivateKey, randomBytes, sign } from "node:crypto";
@@ -29,12 +39,19 @@ export interface SettleResult {
   error?: string;
 }
 
+export type FacilitatorKind = "cdp" | "selfhosted";
+
 export interface FacilitatorConfig {
-  url: string;            // e.g. https://api.cdp.coinbase.com/platform/v2/x402
-  apiKeyId: string;
-  apiKeySecret: string;
-  network: string;        // base | base-sepolia | polygon | arbitrum | solana
+  /** Defaults to "cdp" for back-compat with pre-refactor configs. */
+  kind?: FacilitatorKind;
+  url: string;            // cdp: https://api.cdp.coinbase.com/platform/v2/x402 | selfhosted: your own
+  network: string;        // cdp: base | base-sepolia | ... | selfhosted: any (e.g. eip155:11155111)
   confirmationDepth: number;
+  // cdp only
+  apiKeyId?: string;
+  apiKeySecret?: string;
+  // selfhosted only — optional static bearer for your own facilitator
+  bearerToken?: string;
 }
 
 export interface PaymentRequirements {
@@ -50,10 +67,16 @@ export interface PaymentRequirements {
   extra: Record<string, unknown>;
 }
 
+export interface Facilitator {
+  verify(paymentHeader: string, requirements: PaymentRequirements): Promise<VerifyResult>;
+  settle(paymentHeader: string, requirements: PaymentRequirements): Promise<SettleResult>;
+}
+
 /**
  * Generate a short-lived ES256 JWT for Coinbase CDP API v2 endpoints.
- * Includes request-specific `uri` claim formatted as `<METHOD> <host><pathname>`
- * and a cryptographic random nonce in the header.
+ * Includes request-specific `uri` claim formatted as `<METHOD> <host><pathname>`,
+ * the `aud: ["cdp_service"]` audience CDP requires, and a cryptographic random
+ * nonce in the header.
  */
 export function buildCdpJwt(
   apiKeyId: string,
@@ -75,6 +98,7 @@ export function buildCdpJwt(
   const payload = {
     iss: "cdp",
     sub: apiKeyId,
+    aud: ["cdp_service"],
     nbf: now,
     exp: now + 120,
     uri,
@@ -98,47 +122,98 @@ export function buildCdpJwt(
   return `${data}.${signatureB64}`;
 }
 
-function authHeader(cfg: FacilitatorConfig, method: string, url: string): Record<string, string> {
-  const jwt = buildCdpJwt(cfg.apiKeyId, cfg.apiKeySecret, method, url);
-  return {
-    authorization: `Bearer ${jwt}`,
-  };
-}
-
-export async function facilitatorVerify(
-  cfg: FacilitatorConfig,
-  paymentHeader: string,
-  requirements: PaymentRequirements,
-): Promise<VerifyResult> {
+/** Fail-closed POST shared by both backends. */
+async function postJson<T>(
+  url: string,
+  headers: Record<string, string>,
+  body: unknown,
+  onHttpError: (status: number, text: string) => T,
+  onUnreachable: (message: string) => T,
+): Promise<T | { data: unknown }> {
   try {
-    const url = `${cfg.url.replace(/\/+$/, "")}/verify`;
     const res = await fetch(url, {
       method: "POST",
-      headers: {
-        "content-type": "application/json",
-        accept: "application/json",
-        ...authHeader(cfg, "POST", url),
-      },
-      body: JSON.stringify({
-        x402Version: 1,
-        paymentHeader,
-        paymentRequirements: requirements,
-      }),
+      headers: { "content-type": "application/json", accept: "application/json", ...headers },
+      body: JSON.stringify(body),
     });
     if (!res.ok) {
       const text = await res.text();
-      return {
-        isValid: false,
-        invalidReason: `facilitator ${res.status}: ${text.slice(0, 200)}`,
-      };
+      return onHttpError(res.status, text.replace(/[\r\n]+/g, " ").slice(0, 200));
     }
     const data = (await res.json()) as VerifyResult;
     // Do not infer success from HTTP 2xx alone: delivery is allowed only on
     // the facilitator's explicit boolean grant.
     return { ...data, isValid: res.ok && data.isValid === true };
   } catch (e: any) {
-    return { isValid: false, invalidReason: `facilitator unreachable: ${e?.message ?? String(e)}` };
+    return onUnreachable(e?.message ?? String(e));
   }
+}
+
+function makeBackend(cfg: FacilitatorConfig): Facilitator {
+  const base = cfg.url.replace(/\/+$/, "");
+
+  const kind: FacilitatorKind = cfg.kind ?? "cdp";
+  const authFor = (url: string): Record<string, string> => {
+    if (kind === "cdp") {
+      const jwt = buildCdpJwt(cfg.apiKeyId!, cfg.apiKeySecret!, "POST", url);
+      return { authorization: `Bearer ${jwt}` };
+    }
+    // selfhosted: your own facilitator — static bearer if configured, else none.
+    return cfg.bearerToken ? { authorization: `Bearer ${cfg.bearerToken}` } : {};
+  };
+
+  return {
+    async verify(paymentHeader, requirements): Promise<VerifyResult> {
+      const url = `${base}/verify`;
+      const out = await postJson<VerifyResult>(
+        url,
+        authFor(url),
+        { x402Version: 1, paymentHeader, paymentRequirements: requirements },
+        (status, text) => ({ isValid: false, invalidReason: `facilitator ${status}: ${text}` }),
+        (msg) => ({ isValid: false, invalidReason: `facilitator unreachable: ${msg}` }),
+      );
+      if ("data" in out) {
+        const d = out.data as Partial<VerifyResult>;
+        // Fail-closed: only an explicit isValid === true passes.
+        return d.isValid === true
+          ? { isValid: true }
+          : { isValid: false, invalidReason: d.invalidReason ?? "facilitator did not confirm validity" };
+      }
+      return out;
+    },
+
+    async settle(paymentHeader, requirements): Promise<SettleResult> {
+      const url = `${base}/settle`;
+      const out = await postJson<SettleResult>(
+        url,
+        authFor(url),
+        { x402Version: 1, paymentHeader, paymentRequirements: requirements },
+        (status, text) => ({ success: false, error: `facilitator ${status}: ${text}` }),
+        (msg) => ({ success: false, error: `facilitator unreachable: ${msg}` }),
+      );
+      if ("data" in out) {
+        const d = out.data as Partial<SettleResult>;
+        // Fail-closed: only an explicit success === true passes.
+        return d.success === true
+          ? { success: true, txHash: d.txHash, networkId: d.networkId }
+          : { success: false, error: d.error ?? "facilitator did not confirm settlement" };
+      }
+      return out;
+    },
+  };
+}
+
+export function makeFacilitator(cfg: FacilitatorConfig): Facilitator {
+  return makeBackend(cfg);
+}
+
+// ── Back-compat function API (existing callers/tests) ────────────────────
+export async function facilitatorVerify(
+  cfg: FacilitatorConfig,
+  paymentHeader: string,
+  requirements: PaymentRequirements,
+): Promise<VerifyResult> {
+  return makeFacilitator(cfg).verify(paymentHeader, requirements);
 }
 
 export async function facilitatorSettle(
