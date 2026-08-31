@@ -160,7 +160,7 @@ export async function confirmPayment(
   if (!auth) return { ok: false, reason: "payment authorization unparseable — cannot bind confirmation" };
 
   const asset = cfg.cdpUsdcAddress ?? "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
-  const required = BigInt(String(Math.ceil(pending.amount_usdc * 1e6)));
+  const required = BigInt(pending.amount_usdc);
   if (auth.to !== cfg.vaultAddress!.toLowerCase()) {
     return { ok: false, reason: "authorization recipient is not the vault" };
   }

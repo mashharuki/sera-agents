@@ -140,13 +140,18 @@ async function postJson<T>(
       const text = await res.text();
       return onHttpError(res.status, text.replace(/[\r\n]+/g, " ").slice(0, 200));
     }
-    const data = (await res.json()) as VerifyResult;
-    // Do not infer success from HTTP 2xx alone: delivery is allowed only on
-    // the facilitator's explicit boolean grant.
-    return { ...data, isValid: res.ok && data.isValid === true };
+    // Keep successful response bodies untrusted until the backend-specific
+    // handler validates its explicit grant field (isValid/success === true).
+    return { data: await res.json() };
   } catch (e: any) {
     return onUnreachable(e?.message ?? String(e));
   }
+}
+
+function responseRecord(data: unknown): Record<string, unknown> {
+  return typeof data === "object" && data !== null && !Array.isArray(data)
+    ? (data as Record<string, unknown>)
+    : {};
 }
 
 function makeBackend(cfg: FacilitatorConfig): Facilitator {
@@ -173,11 +178,17 @@ function makeBackend(cfg: FacilitatorConfig): Facilitator {
         (msg) => ({ isValid: false, invalidReason: `facilitator unreachable: ${msg}` }),
       );
       if ("data" in out) {
-        const d = out.data as Partial<VerifyResult>;
+        const d = responseRecord(out.data);
         // Fail-closed: only an explicit isValid === true passes.
         return d.isValid === true
           ? { isValid: true }
-          : { isValid: false, invalidReason: d.invalidReason ?? "facilitator did not confirm validity" };
+          : {
+              isValid: false,
+              invalidReason:
+                typeof d.invalidReason === "string"
+                  ? d.invalidReason
+                  : "facilitator did not confirm validity",
+            };
       }
       return out;
     },
@@ -192,11 +203,19 @@ function makeBackend(cfg: FacilitatorConfig): Facilitator {
         (msg) => ({ success: false, error: `facilitator unreachable: ${msg}` }),
       );
       if ("data" in out) {
-        const d = out.data as Partial<SettleResult>;
+        const d = responseRecord(out.data);
         // Fail-closed: only an explicit success === true passes.
         return d.success === true
-          ? { success: true, txHash: d.txHash, networkId: d.networkId }
-          : { success: false, error: d.error ?? "facilitator did not confirm settlement" };
+          ? {
+              success: true,
+              txHash: typeof d.txHash === "string" ? d.txHash : undefined,
+              networkId: typeof d.networkId === "string" ? d.networkId : undefined,
+            }
+          : {
+              success: false,
+              error:
+                typeof d.error === "string" ? d.error : "facilitator did not confirm settlement",
+            };
       }
       return out;
     },
@@ -221,29 +240,5 @@ export async function facilitatorSettle(
   paymentHeader: string,
   requirements: PaymentRequirements,
 ): Promise<SettleResult> {
-  try {
-    const url = `${cfg.url.replace(/\/+$/, "")}/settle`;
-    const res = await fetch(url, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        accept: "application/json",
-        ...authHeader(cfg, "POST", url),
-      },
-      body: JSON.stringify({
-        x402Version: 1,
-        paymentHeader,
-        paymentRequirements: requirements,
-      }),
-    });
-    if (!res.ok) {
-      const text = await res.text();
-      return { success: false, error: `facilitator ${res.status}: ${text.slice(0, 200)}` };
-    }
-    const data = (await res.json()) as SettleResult;
-    // Do not infer settlement from HTTP 2xx alone.
-    return { ...data, success: res.ok && data.success === true };
-  } catch (e: any) {
-    return { success: false, error: `facilitator unreachable: ${e?.message ?? String(e)}` };
-  }
+  return makeFacilitator(cfg).settle(paymentHeader, requirements);
 }
